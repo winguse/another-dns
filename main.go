@@ -35,7 +35,7 @@ func (a *DNSImpl) query(request *dns.Msg, useVPNDNS bool) (response *dns.Msg, er
 	client := dns.Client{
 		Net: a.net,
 	}
-	ctx, _ := context.WithTimeout(context.TODO(), time.Second*time.Duration(a.queryTimeoutInSeconds))
+	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(a.queryTimeoutInSeconds))
 	dnsServerAddr := a.vpnDNS
 	if !useVPNDNS {
 		if a.localDNS == "" {
