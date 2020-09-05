@@ -2,137 +2,136 @@ package main
 
 import (
 	"flag"
-	"io/ioutil"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
 	"github.com/patrickmn/go-cache"
-	"github.com/yl2chen/cidranger"
 	"golang.org/x/net/context"
 )
 
-// DNSImpl yet anther DNS
-type DNSImpl struct {
-	cache                 *cache.Cache
-	localDNS              string
-	vpnDNS                string
-	eDNSSourceV4          *net.IPNet
-	eDNSSourceV6          *net.IPNet
-	net                   string
-	localRanger           cidranger.Ranger
-	queryTimeoutInSeconds int
-	strictMode            bool
+// AnotherDNS yet anther DNS
+type AnotherDNS struct {
+	net string
 }
 
-func (a *DNSImpl) query(request *dns.Msg, useVPNDNS bool) (response *dns.Msg, err error) {
+var (
+	isLocalCache = cache.New(60*time.Minute, 10*time.Minute)
+	probeTimeout = time.Second * time.Duration(2)
+
+	port                  = flag.Int("port", 8053, "port to run on")
+	localDNS              = flag.String("local-dns", "119.28.28.28:53", "local DNS server")
+	vpnDNS                = flag.String("vpn-dns", "8.8.8.8:53", "vpn DNS server")
+	probeDNS              = flag.String("probe-dns", "192.168.11.253:8053", "probe DNS server, when this DNS returns a response, mark the query is polluted")
+	probeDomain           = flag.String("probe-domain", "www.google.com", "probe domain")
+	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 1.5, "probe DNS query timeout factor")
+	queryTimeoutInSeconds = flag.Int("timeout-seconds", 60, "DNS query timeout in seconds")
+)
+
+func refreshProbeTimeout() {
 	client := dns.Client{
-		Net: a.net,
+		Net:     "udp",
+		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
 	}
-	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(a.queryTimeoutInSeconds))
-	dnsServerAddr := a.vpnDNS
-	if !useVPNDNS {
-		if a.localDNS == "" {
-			isV6Request := len(request.Question) > 0 && request.Question[0].Qtype == dns.TypeAAAA
-			request.Extra = append(request.Extra, a.buildEDNSSource(!isV6Request))
-		} else {
-			dnsServerAddr = a.localDNS
-		}
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(*probeDomain), dns.TypeA)
+	for {
+		startTime := time.Now()
+		client.Exchange(msg, *probeDNS) // ignore any result
+		probeTimeout = time.Nanosecond * time.Duration(int64(float64(time.Now().Sub(startTime).Nanoseconds())**probeTimeoutFactor))
+		log.Println("new probe timeout ms:", int64(probeTimeout/time.Millisecond))
+		time.Sleep(time.Minute)
 	}
-	response, _, err = client.ExchangeContext(ctx, request, dnsServerAddr)
-	return
 }
 
-func (a *DNSImpl) buildEDNSSource(useIPv4 bool) *dns.OPT {
-	dnsOption := &dns.OPT{
-		Hdr: dns.RR_Header{
-			Name:   ".",
-			Rrtype: dns.TypeOPT,
-		},
-	}
-	address := a.eDNSSourceV4.IP
-	sourceScope, _ := a.eDNSSourceV4.Mask.Size()
-	family := (uint16)(1)
-	sourceNetmask := 32
-	if !useIPv4 {
-		address = a.eDNSSourceV6.IP
-		sourceScope, _ = a.eDNSSourceV6.Mask.Size()
-		family = 2
-		sourceNetmask = 128
-	}
-
-	eDNSSubnet := &dns.EDNS0_SUBNET{
-		Code:          dns.EDNS0SUBNET,
-		Address:       address,
-		Family:        family,
-		SourceScope:   (uint8)(sourceScope),
-		SourceNetmask: (uint8)(sourceNetmask),
-	}
-	dnsOption.Option = append(dnsOption.Option, eDNSSubnet)
-	return dnsOption
-}
-
-func (a *DNSImpl) isLocalDomain(domain string) bool {
-	cacheKey := "is-local:" + domain
-	if res, ok := a.cache.Get(cacheKey); ok {
+func isLocal(domain string) bool {
+	if res, ok := isLocalCache.Get(domain); ok {
 		return res.(bool)
 	}
-	request := new(dns.Msg)
-	request.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	request.Extra = append(request.Extra, a.buildEDNSSource(true))
-	response, err := a.query(request, true)
-	if err != nil {
-		if a.strictMode { // if strict mode, always query vpn dns
-			return false
-		}
-		return true
+	client := dns.Client{
+		Net:     "udp",
+		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
 	}
-	result := false
-	for _, ans := range response.Answer {
-		if aRecord, ok := ans.(*dns.A); ok {
-			if contains, err := a.localRanger.Contains(aRecord.A); contains && err == nil {
-				result = true
-				break
-			}
-		}
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+
+	ctx, _ := context.WithTimeout(context.Background(), probeTimeout)
+	ch := make(chan bool)
+
+	probe := func() {
+		_, _, err := client.ExchangeContext(ctx, msg, *probeDNS)
+		ch <- err != nil // local domain will be timeout
 	}
-	log.Printf("%s is local %t\n", domain, result)
-	a.cache.SetDefault(cacheKey, result)
+
+	// probe twice, to make the result more stable
+	go probe()
+	go probe()
+
+	firstProbe := <-ch
+	secondProbe := <-ch
+
+	result := firstProbe && secondProbe
+
+	res := ""
+	if result {
+		res = "not"
+	}
+
+	log.Printf("%s is %s polluted domain.", domain, res)
+	isLocalCache.SetDefault(domain, result)
+
 	return result
 }
 
 // ServeDNS serve DNS request
-func (a *DNSImpl) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
-	useVPNDNS := len(request.Question) > 0 && !a.isLocalDomain(request.Question[0].Name)
-	response, err := a.query(request, useVPNDNS)
-	if err == nil {
-		w.WriteMsg(response.SetReply(request))
+func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(*queryTimeoutInSeconds))
+	client := dns.Client{
+		Net:     a.net,
+		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
+	}
+
+	ch := make(chan interface{})
+	go func() {
+		response, _, err := client.ExchangeContext(ctx, request, *vpnDNS)
+		if err != nil {
+			ch <- err
+		} else {
+			ch <- response
+		}
+	}()
+
+	useVPNDNS := len(request.Question) > 0 && !isLocal(request.Question[0].Name)
+	if useVPNDNS {
+		res := <-ch
+		if err, isErr := res.(error); isErr {
+			log.Printf("Error while query VPN DNS: %s\n", err)
+		} else if response, isResponse := res.(*dns.Msg); isResponse {
+			w.WriteMsg(response.SetReply(request))
+		} else {
+			log.Fatal("Unknown message.", res)
+		}
 	} else {
-		log.Printf("Error while query DNS: %s\n", err)
-		w.WriteMsg((&dns.Msg{}).SetReply(request))
+		response, _, err := client.ExchangeContext(ctx, request, *localDNS)
+		if response != nil {
+			w.WriteMsg(response.SetReply(request))
+		}
+		if err != nil {
+			log.Printf("Error while query DNS: %s\n", err)
+		}
 	}
 }
 
-func startServer(cache *cache.Cache, port int, net string, localDNS string, vpnDNS string, eDNSSourceV4 *net.IPNet, eDNSSourceV6 *net.IPNet, localRanger cidranger.Ranger, queryTimeoutInSeconds int, strictMode bool) {
-	impl := &DNSImpl{
-		cache:                 cache,
-		localDNS:              localDNS,
-		vpnDNS:                vpnDNS,
-		eDNSSourceV4:          eDNSSourceV4,
-		eDNSSourceV6:          eDNSSourceV6,
-		net:                   net,
-		localRanger:           localRanger,
-		queryTimeoutInSeconds: queryTimeoutInSeconds,
-		strictMode:            strictMode,
+func startServer(net string) {
+	impl := &AnotherDNS{
+		net: net,
 	}
 	srv := &dns.Server{
-		Addr:    ":" + strconv.Itoa(port),
+		Addr:    ":" + strconv.Itoa(*port),
 		Net:     net,
 		Handler: impl,
 	}
@@ -141,52 +140,12 @@ func startServer(cache *cache.Cache, port int, net string, localDNS string, vpnD
 	}
 }
 
-func loadLocalCIDR(filePath string) cidranger.Ranger {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		log.Fatalf("Failed to read CIDR file from %s\n", err.Error())
-	}
-	ranger := cidranger.NewPCTrieRanger()
-	for _, line := range strings.Split(string(data), "\n") {
-		cidr := strings.TrimSpace(line)
-		_, network, err := net.ParseCIDR(cidr)
-		if err != nil {
-			log.Printf("Skiping %s\n", line)
-		} else {
-			ranger.Insert(cidranger.NewBasicRangerEntry(*network))
-		}
-	}
-	return ranger
-}
-
 func main() {
-
-	port := flag.Int("port", 8053, "port to run on")
-	localDNS := flag.String("local-dns", "", "local DNS server, default empty. if empty, then query vpn DNS with eDNS source")
-	vpnDNS := flag.String("vpn-dns", "8.8.8.8:53", "vpn DNS server")
-	eDNSSourceV4String := flag.String("edns-source-v4", "101.6.8.193/32", "the source range of edns v4, default to a range in Beijing")
-	eDNSSourceV6String := flag.String("edns-source-v6", "2402:f000:1:408:8100::1/128", "the source range of edns v6, default to a range in Beijing")
-	localIPListFile := flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
-	queryTimeoutInSeconds := flag.Int("timeout-seconds", 5, "DNS query timeout in seconds")
-	strictMode := flag.Bool("strict", false, "when strict mode is true, then we will never leak DNS query to local DNS event the VPN dns is down")
-
 	flag.Parse()
 
-	localRanger := loadLocalCIDR(*localIPListFile)
-	cache := cache.New(5*time.Minute, 10*time.Minute)
-
-	_, eDNSSourceV4, err := net.ParseCIDR(*eDNSSourceV4String)
-	if err != nil || eDNSSourceV4.IP.To4() == nil {
-		log.Panicf("Failed to parse eDNS source V4 from %s", *eDNSSourceV4String)
-	}
-
-	_, eDNSSourceV6, err := net.ParseCIDR(*eDNSSourceV6String)
-	if err != nil || eDNSSourceV6.IP.To4() != nil {
-		log.Panicf("Failed to parse eDNS source V6 from %s", *eDNSSourceV4String)
-	}
-
-	go startServer(cache, *port, "udp", *localDNS, *vpnDNS, eDNSSourceV4, eDNSSourceV6, localRanger, *queryTimeoutInSeconds, *strictMode)
-	go startServer(cache, *port, "tcp", *localDNS, *vpnDNS, eDNSSourceV4, eDNSSourceV6, localRanger, *queryTimeoutInSeconds, *strictMode)
+	go refreshProbeTimeout()
+	go startServer("udp")
+	go startServer("tcp")
 
 	log.Printf("Working on port %d\n", *port)
 
