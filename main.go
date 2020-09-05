@@ -1,16 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"flag"
+	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
-	"github.com/patrickmn/go-cache"
+	"github.com/yl2chen/cidranger"
 	"golang.org/x/net/context"
 )
 
@@ -19,17 +25,118 @@ type AnotherDNS struct {
 	net string
 }
 
+type dnsPolicy struct {
+	domain     string
+	useVPN     bool
+	queryCount int64
+}
+
+type policyManager struct {
+	policies       map[string]*dnsPolicy
+	lock           sync.RWMutex
+	maxMemoryItems int
+}
+
+func (p *policyManager) load(fileName string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatalf("Failed to policy file %s\n", err.Error())
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		items := strings.Split(line, "\t")
+		if len(items) != 3 {
+			log.Printf("Skipping line %s\n", line)
+			continue
+		}
+		domain := items[0]
+		useVPN := items[1] == "T"
+		queryCount, _ := strconv.ParseInt(items[2], 10, 64)
+		policy := &dnsPolicy{
+			domain,
+			useVPN,
+			queryCount,
+		}
+		p.policies[domain] = policy
+	}
+}
+
+func (p *policyManager) write(fileName string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	file, err := os.Create(fileName)
+	if err != nil {
+		log.Fatalf("Failed to policy file %s\n", err.Error())
+	}
+	defer file.Close()
+
+	for _, policy := range p.policies {
+		useVPNField := "F"
+		if policy.useVPN {
+			useVPNField = "T"
+		}
+		file.WriteString(policy.domain + "\t" + useVPNField + "\t" + strconv.FormatInt(policy.queryCount, 10) + "\n")
+	}
+}
+
+func (p *policyManager) get(domain string) (bool, bool) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	if res, ok := p.policies[domain]; ok {
+		res.queryCount++
+		return res.useVPN, true
+	}
+	return false, false
+}
+
+func (p *policyManager) set(domain string, useVPN bool) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.policies[domain] = &dnsPolicy{
+		domain:     domain,
+		useVPN:     useVPN,
+		queryCount: 1,
+	}
+}
+
+func (p *policyManager) gc() {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	all := make([]*dnsPolicy, len(p.policies))
+	i := 0
+	for _, policy := range p.policies {
+		all[i] = policy
+		i++
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].queryCount > all[j].queryCount
+	})
+	for i = p.maxMemoryItems; i < len(all); i++ {
+		delete(p.policies, all[i].domain)
+	}
+}
+
 var (
-	isLocalCache = cache.New(60*time.Minute, 10*time.Minute)
 	probeTimeout = time.Second * time.Duration(2)
+	cnRages      = cidranger.NewPCTrieRanger()
+	policies     = policyManager{}
 
 	port                  = flag.Int("port", 8053, "port to run on")
 	localDNS              = flag.String("local-dns", "119.28.28.28:53", "local DNS server")
 	vpnDNS                = flag.String("vpn-dns", "8.8.8.8:53", "vpn DNS server")
 	probeDNS              = flag.String("probe-dns", "192.168.11.253:8053", "probe DNS server, when this DNS returns a response, mark the query is polluted")
 	probeDomain           = flag.String("probe-domain", "www.google.com", "probe domain")
-	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 1.5, "probe DNS query timeout factor")
-	queryTimeoutInSeconds = flag.Int("timeout-seconds", 60, "DNS query timeout in seconds")
+	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 2, "probe DNS query timeout factor")
+	queryTimeoutInSeconds = flag.Int("timeout-seconds", 30, "DNS query timeout in seconds")
+	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
+	policyMemoryFile      = flag.String("policy-memory-file", "dns-policy.txt", "the file to save policies")
+	maxMemoryItems        = flag.Int("max-memory-items", 10240, "the max number of policy to remember")
 )
 
 func refreshProbeTimeout() {
@@ -44,13 +151,17 @@ func refreshProbeTimeout() {
 		client.Exchange(msg, *probeDNS) // ignore any result
 		probeTimeout = time.Nanosecond * time.Duration(int64(float64(time.Now().Sub(startTime).Nanoseconds())**probeTimeoutFactor))
 		log.Println("new probe timeout ms:", int64(probeTimeout/time.Millisecond))
+		policies.gc()
 		time.Sleep(time.Minute)
 	}
 }
 
-func isLocal(domain string) bool {
-	if res, ok := isLocalCache.Get(domain); ok {
-		return res.(bool)
+func shouldUseVPN(domain string) bool {
+	if domain == "" {
+		return true
+	}
+	if res, ok := policies.get(domain); ok {
+		return res
 	}
 	client := dns.Client{
 		Net:     "udp",
@@ -64,7 +175,7 @@ func isLocal(domain string) bool {
 
 	probe := func() {
 		_, _, err := client.ExchangeContext(ctx, msg, *probeDNS)
-		ch <- err != nil // local domain will be timeout
+		ch <- err == nil // success means it's polluted
 	}
 
 	// probe twice, to make the result more stable
@@ -74,17 +185,17 @@ func isLocal(domain string) bool {
 	firstProbe := <-ch
 	secondProbe := <-ch
 
-	result := firstProbe && secondProbe
+	polluted := firstProbe && secondProbe
 
-	res := ""
-	if result {
-		res = "not"
+	res := " not"
+	if polluted {
+		res = ""
 	}
 
-	log.Printf("%s is %s polluted domain.", domain, res)
-	isLocalCache.SetDefault(domain, result)
+	log.Printf("%s is%s polluted domain.", domain, res)
+	policies.set(domain, polluted)
 
-	return result
+	return polluted
 }
 
 // ServeDNS serve DNS request
@@ -105,8 +216,7 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		}
 	}()
 
-	useVPNDNS := len(request.Question) > 0 && !isLocal(request.Question[0].Name)
-	if useVPNDNS {
+	sendVPNDNSResponse := func() {
 		res := <-ch
 		if err, isErr := res.(error); isErr {
 			log.Printf("Error while query VPN DNS: %s\n", err)
@@ -115,13 +225,56 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		} else {
 			log.Fatal("Unknown message.", res)
 		}
+	}
+
+	domain := ""
+	if len(request.Question) > 0 {
+		domain = request.Question[0].Name
+	}
+
+	useVPNDNS := shouldUseVPN(domain)
+	if useVPNDNS {
+		sendVPNDNSResponse()
 	} else {
 		response, _, err := client.ExchangeContext(ctx, request, *localDNS)
 		if response != nil {
-			w.WriteMsg(response.SetReply(request))
+			var useVPNDNSResponse = true
+			var isARecord = false
+			for _, ans := range response.Answer {
+				if aRecord, ok := ans.(*dns.A); ok {
+					isARecord = true
+					if contains, err := cnRages.Contains(aRecord.A); contains && err == nil {
+						useVPNDNSResponse = false
+						break
+					}
+				}
+			}
+			if isARecord && useVPNDNSResponse {
+				log.Printf("%s is foreign domain\n", domain)
+				policies.set(domain, true) // override as we use VPN dns
+				sendVPNDNSResponse()
+			} else {
+				w.WriteMsg(response.SetReply(request))
+			}
 		}
 		if err != nil {
 			log.Printf("Error while query DNS: %s\n", err)
+		}
+	}
+}
+
+func loadLocalCIDR() {
+	data, err := ioutil.ReadFile(*localIPListFile)
+	if err != nil {
+		log.Fatalf("Failed to read CIDR file from %s\n", err.Error())
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		cidr := strings.TrimSpace(line)
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("Skiping line: %s\n", line)
+		} else {
+			cnRages.Insert(cidranger.NewBasicRangerEntry(*network))
 		}
 	}
 }
@@ -143,6 +296,11 @@ func startServer(net string) {
 func main() {
 	flag.Parse()
 
+	policies.maxMemoryItems = *maxMemoryItems
+	policies.policies = make(map[string]*dnsPolicy)
+	policies.load(*policyMemoryFile)
+	loadLocalCIDR()
+
 	go refreshProbeTimeout()
 	go startServer("udp")
 	go startServer("tcp")
@@ -152,5 +310,6 @@ func main() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
+	policies.write(*policyMemoryFile)
 	log.Fatalf("Signal (%v) received, stopping\n", s)
 }

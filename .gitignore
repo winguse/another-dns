@@ -19,3 +19,4 @@ vendor
 .DS_*
 
 cn-cidrs.txt
+dns-policy.txt
