@@ -200,10 +200,22 @@ func shouldUseVPN(domain string) bool {
 
 // ServeDNS serve DNS request
 func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	domain := ""
+	if len(request.Question) > 0 {
+		domain = request.Question[0].Name
+	}
 	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(*queryTimeoutInSeconds))
 	client := dns.Client{
 		Net:     a.net,
 		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
+	}
+
+	if strings.HasSuffix(domain, ".arpa.") {
+		response, _, err := client.ExchangeContext(ctx, request, *localDNS)
+		if err == nil {
+			w.WriteMsg(response.SetReply(request))
+		}
+		return
 	}
 
 	ch := make(chan interface{})
@@ -225,11 +237,6 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		} else {
 			log.Fatal("Unknown message.", res)
 		}
-	}
-
-	domain := ""
-	if len(request.Question) > 0 {
-		domain = request.Question[0].Name
 	}
 
 	useVPNDNS := shouldUseVPN(domain)
