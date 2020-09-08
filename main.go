@@ -137,6 +137,7 @@ var (
 	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
 	policyMemoryFile      = flag.String("policy-memory-file", "dns-policy.txt", "the file to save policies")
 	maxMemoryItems        = flag.Int("max-memory-items", 10240, "the max number of policy to remember")
+	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", true, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
 )
 
 func refreshProbeTimeout() {
@@ -163,39 +164,50 @@ func shouldUseVPN(domain string) bool {
 	if res, ok := policies.get(domain); ok {
 		return res
 	}
-	client := dns.Client{
-		Net:     "udp",
-		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
+
+	detectCh := make(chan bool)
+
+	// async check domain
+	go func() {
+		client := dns.Client{
+			Net:     "udp",
+			Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
+		}
+		msg := new(dns.Msg)
+		msg.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+
+		ctx, _ := context.WithTimeout(context.Background(), probeTimeout)
+		ch := make(chan bool)
+
+		probe := func() {
+			_, _, err := client.ExchangeContext(ctx, msg, *probeDNS)
+			ch <- err == nil // success means it's polluted
+		}
+
+		// probe twice, to make the result more stable
+		go probe()
+		go probe()
+
+		firstProbe := <-ch
+		secondProbe := <-ch
+
+		polluted := firstProbe && secondProbe
+
+		res := " not"
+		if polluted {
+			res = ""
+		}
+
+		log.Printf("%s is%s polluted domain.", domain, res)
+		policies.set(domain, polluted)
+		detectCh <- polluted
+	}()
+
+	if *noKnowledgeUseVPN {
+		return true // use vpn dns as I don't know
 	}
-	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 
-	ctx, _ := context.WithTimeout(context.Background(), probeTimeout)
-	ch := make(chan bool)
-
-	probe := func() {
-		_, _, err := client.ExchangeContext(ctx, msg, *probeDNS)
-		ch <- err == nil // success means it's polluted
-	}
-
-	// probe twice, to make the result more stable
-	go probe()
-	go probe()
-
-	firstProbe := <-ch
-	secondProbe := <-ch
-
-	polluted := firstProbe && secondProbe
-
-	res := " not"
-	if polluted {
-		res = ""
-	}
-
-	log.Printf("%s is%s polluted domain.", domain, res)
-	policies.set(domain, polluted)
-
-	return polluted
+	return <-detectCh
 }
 
 // ServeDNS serve DNS request
