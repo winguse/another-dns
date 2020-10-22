@@ -54,9 +54,9 @@ func (p *policyManager) load(fileName string) {
 			log.Printf("Skipping line %s\n", line)
 			continue
 		}
-		domain := items[0]
-		useVPN := items[1] == "T"
-		queryCount, _ := strconv.ParseInt(items[2], 10, 64)
+		useVPN := items[0] == "T"
+		queryCount, _ := strconv.ParseInt(items[1], 10, 64)
+		domain := items[2]
 		policy := &dnsPolicy{
 			domain,
 			useVPN,
@@ -82,7 +82,7 @@ func (p *policyManager) write(fileName string) {
 		if policy.useVPN {
 			useVPNField = "T"
 		}
-		file.WriteString(policy.domain + "\t" + useVPNField + "\t" + strconv.FormatInt(policy.queryCount, 10) + "\n")
+		file.WriteString(useVPNField + "\t" + strconv.FormatInt(policy.queryCount, 10) + "\t" + policy.domain + "\n")
 	}
 }
 
