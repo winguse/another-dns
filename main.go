@@ -72,7 +72,8 @@ func (p *policyManager) write(fileName string) {
 
 	file, err := os.Create(fileName)
 	if err != nil {
-		log.Fatalf("Failed to policy file %s\n", err.Error())
+		log.Printf("Failed to write policy file %s\n", err.Error())
+		return
 	}
 	defer file.Close()
 
@@ -137,7 +138,7 @@ var (
 	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
 	policyMemoryFile      = flag.String("policy-memory-file", "dns-policy.txt", "the file to save policies")
 	maxMemoryItems        = flag.Int("max-memory-items", 10240, "the max number of policy to remember")
-	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", true, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
+	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
 )
 
 func refreshProbeTimeout() {
@@ -149,10 +150,15 @@ func refreshProbeTimeout() {
 	msg.SetQuestion(dns.Fqdn(*probeDomain), dns.TypeA)
 	for {
 		startTime := time.Now()
-		client.Exchange(msg, *probeDNS) // ignore any result
-		probeTimeout = time.Nanosecond * time.Duration(int64(float64(time.Now().Sub(startTime).Nanoseconds())**probeTimeoutFactor))
-		log.Println("new probe timeout ms:", int64(probeTimeout/time.Millisecond))
+		_, _, err := client.Exchange(msg, *probeDNS) // ignore any result
+		if err == nil {
+			probeTimeout = time.Nanosecond * time.Duration(int64(float64(time.Now().Sub(startTime).Nanoseconds())**probeTimeoutFactor))
+			log.Println("new probe timeout ms:", int64(probeTimeout/time.Millisecond))
+		} else {
+			log.Panicln("Failed to probe domain, if it happen every time, it can be wrong setting of probe domain or probe DNS.")
+		}
 		policies.gc()
+		policies.write(*policyMemoryFile)
 		time.Sleep(time.Minute)
 	}
 }
@@ -191,7 +197,7 @@ func shouldUseVPN(domain string) bool {
 		firstProbe := <-ch
 		secondProbe := <-ch
 
-		polluted := firstProbe && secondProbe
+		polluted := firstProbe || secondProbe
 
 		res := " not"
 		if polluted {
@@ -330,5 +336,5 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
 	policies.write(*policyMemoryFile)
-	log.Fatalf("Signal (%v) received, stopping\n", s)
+	log.Printf("Signal (%v) received, stopping\n", s)
 }
