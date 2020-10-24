@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,11 +37,12 @@ type keywordPolicy struct {
 }
 
 type policyManager struct {
-	positiveRegex  *regexp.Regexp
-	negativeRegex  *regexp.Regexp
-	policies       map[string]*dnsPolicy
-	lock           sync.RWMutex
-	maxMemoryItems int
+	domainPolicies  map[string]bool
+	suffixPolicies  map[string]bool
+	keywordPolicies []keywordPolicy
+	policies        map[string]*dnsPolicy
+	lock            sync.RWMutex
+	maxMemoryItems  int
 }
 
 func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
@@ -55,8 +55,6 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 	}
 	defer staticFile.Close()
 	staticScanner := bufio.NewScanner(staticFile)
-	var positiveRegexSlices []string
-	var negativeRegexSlices []string
 	for staticScanner.Scan() {
 		line := strings.TrimSpace(strings.Split(strings.TrimSpace(staticScanner.Text()), "#")[0])
 		if line == "" {
@@ -66,31 +64,17 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 		if len(items) != 3 {
 			log.Panicf("Cannot read config: %s\n", line)
 		}
-		regex := items[2]
-		if items[0] == "REGEX" {
-			// all done
-		} else if items[0] == "DOMAIN" {
-			regex = "^" + regexp.QuoteMeta(items[2]) + "$"
+		useVPN := items[1] == "T"
+		if items[0] == "DOMAIN" {
+			p.domainPolicies[items[2]] = useVPN
 		} else if items[0] == "SUFFIX" {
-			if strings.HasPrefix(items[2], ".") {
-				noLeadingDot := string([]byte(items[2])[1:])
-				regex = "(^|\\.)" + noLeadingDot + "$"
-			} else {
-				regex = regexp.QuoteMeta(items[2]) + "$"
-			}
+			p.suffixPolicies[items[2]] = useVPN
 		} else if items[0] == "KEYWORD" {
-			regex = regexp.QuoteMeta(items[2])
+			p.keywordPolicies = append(p.keywordPolicies, keywordPolicy{items[2], useVPN})
 		} else {
 			log.Panicf("Cannot read config: %s, unknown type: %s\n", line, items[0])
 		}
-		if items[1] == "T" {
-			positiveRegexSlices = append(positiveRegexSlices, regex)
-		} else {
-			negativeRegexSlices = append(negativeRegexSlices, regex)
-		}
 	}
-	p.positiveRegex = regexp.MustCompile(strings.Join(positiveRegexSlices, "|"))
-	p.negativeRegex = regexp.MustCompile(strings.Join(negativeRegexSlices, "|"))
 
 	memorizeFile, err := os.Open(memorizeFilePath)
 	if err != nil {
@@ -143,13 +127,26 @@ func (p *policyManager) get(domain string) (bool, bool) {
 
 	withoutDotDomain := strings.TrimSuffix(domain, ".")
 
-	if p.negativeRegex.MatchString(withoutDotDomain) {
-		log.Printf("matched static negative rule: %s\n", domain)
-		return false, true
+	items := strings.Split(withoutDotDomain, ".")
+	itemsLen := len(items)
+
+	if useVPN, ok := p.domainPolicies[strings.Join(items, ".")]; ok {
+		log.Printf("matched static domain rule: %s\n", domain)
+		return useVPN, true
 	}
-	if p.positiveRegex.MatchString(withoutDotDomain) {
-		log.Printf("matched static positive rule: %s\n", domain)
-		return true, true
+
+	for i := itemsLen - 1; i >= 0; i-- {
+		if useVPN, ok := p.suffixPolicies[strings.Join(items[i:itemsLen], ".")]; ok {
+			log.Printf("matched suffix domain rule: %s\n", domain)
+			return useVPN, true
+		}
+	}
+
+	for _, keywordPolicy := range p.keywordPolicies {
+		if strings.Contains(domain, keywordPolicy.keyword) {
+			log.Printf("matched keyword domain rule: %s\n", domain)
+			return keywordPolicy.useVPN, true
+		}
 	}
 
 	if res, ok := p.policies[domain]; ok {
@@ -378,6 +375,10 @@ func main() {
 	flag.Parse()
 
 	policies.maxMemoryItems = *maxMemorizeItems
+	policies.domainPolicies = make(map[string]bool)
+	policies.suffixPolicies = make(map[string]bool)
+	policies.keywordPolicies = []keywordPolicy{}
+	policies.policies = make(map[string]*dnsPolicy)
 	policies.policies = make(map[string]*dnsPolicy)
 	policies.load(*policyStaticFile, *policyMemorizeFile)
 	loadLocalCIDR()
