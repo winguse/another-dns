@@ -20,3 +20,4 @@ vendor
 
 cn-cidrs.txt
 dns-policy.txt
+static-dns-policy.txt

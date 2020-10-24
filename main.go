@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,22 +32,67 @@ type dnsPolicy struct {
 	queryCount int64
 }
 
+type keywordPolicy struct {
+	keyword string
+	useVPN  bool
+}
+
 type policyManager struct {
+	positiveRegex  *regexp.Regexp
+	negativeRegex  *regexp.Regexp
 	policies       map[string]*dnsPolicy
 	lock           sync.RWMutex
 	maxMemoryItems int
 }
 
-func (p *policyManager) load(fileName string) {
+func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	file, err := os.Open(fileName)
+	staticFile, err := os.Open(staticFilePath)
 	if err != nil {
-		log.Fatalf("Failed to policy file %s\n", err.Error())
+		log.Fatalf("Failed to static policy file %s\n", err.Error())
 	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	defer staticFile.Close()
+	staticScanner := bufio.NewScanner(staticFile)
+	var positiveRegexSlices []string
+	var negativeRegexSlices []string
+	for staticScanner.Scan() {
+		line := strings.TrimSpace(strings.Split(staticScanner.Text(), "#")[0])
+		if line == "" {
+			continue
+		}
+		items := strings.Split(line, "\t")
+		if len(items) != 3 {
+			log.Panicf("Cannot read config: %s\n", line)
+		}
+		if items[0] == "SUFFIX" {
+			regex := regexp.QuoteMeta(items[2]) + "$"
+			if items[1] == "T" {
+				positiveRegexSlices = append(positiveRegexSlices, regex)
+			} else {
+				negativeRegexSlices = append(negativeRegexSlices, regex)
+			}
+		} else if items[0] == "KEYWORD" {
+			regex := regexp.QuoteMeta(items[2])
+			if items[1] == "T" {
+				positiveRegexSlices = append(positiveRegexSlices, regex)
+			} else {
+				negativeRegexSlices = append(negativeRegexSlices, regex)
+			}
+		} else {
+			log.Panicf("Cannot read config: %s, unknown type: %s\n", line, items[0])
+		}
+	}
+	p.positiveRegex = regexp.MustCompile(strings.Join(positiveRegexSlices, "|"))
+	p.negativeRegex = regexp.MustCompile(strings.Join(negativeRegexSlices, "|"))
+
+	memorizeFile, err := os.Open(memorizeFilePath)
+	if err != nil {
+		log.Fatalf("Failed to memorize policy file %s\n", err.Error())
+	}
+	defer memorizeFile.Close()
+	scanner := bufio.NewScanner(memorizeFile)
 	for scanner.Scan() {
 		line := scanner.Text()
 		items := strings.Split(line, "\t")
@@ -89,6 +135,18 @@ func (p *policyManager) write(fileName string) {
 func (p *policyManager) get(domain string) (bool, bool) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
+
+	withoutDotDomain := strings.TrimSuffix(domain, ".")
+
+	if p.negativeRegex.MatchString(withoutDotDomain) {
+		log.Printf("matched static negative rule: %s\n", domain)
+		return false, true
+	}
+	if p.positiveRegex.MatchString(withoutDotDomain) {
+		log.Printf("matched static positive rule: %s\n", domain)
+		return true, true
+	}
+
 	if res, ok := p.policies[domain]; ok {
 		res.queryCount++
 		return res.useVPN, true
@@ -136,8 +194,9 @@ var (
 	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 2, "probe DNS query timeout factor")
 	queryTimeoutInSeconds = flag.Int("timeout-seconds", 30, "DNS query timeout in seconds")
 	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
-	policyMemoryFile      = flag.String("policy-memory-file", "dns-policy.txt", "the file to save policies")
-	maxMemoryItems        = flag.Int("max-memory-items", 10240, "the max number of policy to remember")
+	policyMemorizeFile    = flag.String("policy-memorize-file", "dns-policy.txt", "the file to save policies")
+	policyStaticFile      = flag.String("policy-static-file", "static-dns-policy.txt", "the file to save policies")
+	maxMemorizeItems      = flag.Int("max-memorize-items", 10240, "the max number of policy to remember")
 	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
 )
 
@@ -155,10 +214,10 @@ func refreshProbeTimeout() {
 			probeTimeout = time.Nanosecond * time.Duration(int64(float64(time.Now().Sub(startTime).Nanoseconds())**probeTimeoutFactor))
 			log.Println("new probe timeout ms:", int64(probeTimeout/time.Millisecond))
 		} else {
-			log.Panicln("Failed to probe domain, if it happen every time, it can be wrong setting of probe domain or probe DNS.")
+			log.Println("Failed to probe domain, if it happen every time, it can be wrong setting of probe domain or probe DNS.")
 		}
 		policies.gc()
-		policies.write(*policyMemoryFile)
+		policies.write(*policyMemorizeFile)
 		time.Sleep(time.Minute)
 	}
 }
@@ -321,9 +380,9 @@ func startServer(net string) {
 func main() {
 	flag.Parse()
 
-	policies.maxMemoryItems = *maxMemoryItems
+	policies.maxMemoryItems = *maxMemorizeItems
 	policies.policies = make(map[string]*dnsPolicy)
-	policies.load(*policyMemoryFile)
+	policies.load(*policyStaticFile, *policyMemorizeFile)
 	loadLocalCIDR()
 
 	go refreshProbeTimeout()
@@ -335,6 +394,6 @@ func main() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
-	policies.write(*policyMemoryFile)
+	policies.write(*policyMemorizeFile)
 	log.Printf("Signal (%v) received, stopping\n", s)
 }
