@@ -72,7 +72,12 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 		} else if items[0] == "DOMAIN" {
 			regex = "^" + regexp.QuoteMeta(items[2]) + "$"
 		} else if items[0] == "SUFFIX" {
-			regex = regexp.QuoteMeta(items[2]) + "$"
+			if strings.HasPrefix(items[2], ".") {
+				noLeadingDot := string([]byte(items[2])[1:])
+				regex = "(^|\\.)" + noLeadingDot + "$"
+			} else {
+				regex = regexp.QuoteMeta(items[2]) + "$"
+			}
 		} else if items[0] == "KEYWORD" {
 			regex = regexp.QuoteMeta(items[2])
 		} else {
