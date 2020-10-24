@@ -131,20 +131,20 @@ func (p *policyManager) get(domain string) (bool, bool) {
 	itemsLen := len(items)
 
 	if useVPN, ok := p.domainPolicies[strings.Join(items, ".")]; ok {
-		log.Printf("matched static domain rule: %s\n", domain)
+		log.Printf("matched static domain rule: %s, %t\n", domain, useVPN)
 		return useVPN, true
 	}
 
 	for i := itemsLen - 1; i >= 0; i-- {
 		if useVPN, ok := p.suffixPolicies[strings.Join(items[i:itemsLen], ".")]; ok {
-			log.Printf("matched suffix domain rule: %s\n", domain)
+			log.Printf("matched suffix domain rule: %s, %t\n", domain, useVPN)
 			return useVPN, true
 		}
 	}
 
 	for _, keywordPolicy := range p.keywordPolicies {
 		if strings.Contains(domain, keywordPolicy.keyword) {
-			log.Printf("matched keyword domain rule: %s\n", domain)
+			log.Printf("matched keyword domain rule: %s, %t\n", domain, keywordPolicy.useVPN)
 			return keywordPolicy.useVPN, true
 		}
 	}
