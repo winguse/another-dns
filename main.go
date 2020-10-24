@@ -66,22 +66,22 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 		if len(items) != 3 {
 			log.Panicf("Cannot read config: %s\n", line)
 		}
-		if items[0] == "SUFFIX" {
-			regex := regexp.QuoteMeta(items[2]) + "$"
-			if items[1] == "T" {
-				positiveRegexSlices = append(positiveRegexSlices, regex)
-			} else {
-				negativeRegexSlices = append(negativeRegexSlices, regex)
-			}
+		regex := items[2]
+		if items[0] == "REGEX" {
+			// all done
+		} else if items[0] == "DOMAIN" {
+			regex = "^" + regexp.QuoteMeta(items[2]) + "$"
+		} else if items[0] == "SUFFIX" {
+			regex = regexp.QuoteMeta(items[2]) + "$"
 		} else if items[0] == "KEYWORD" {
-			regex := regexp.QuoteMeta(items[2])
-			if items[1] == "T" {
-				positiveRegexSlices = append(positiveRegexSlices, regex)
-			} else {
-				negativeRegexSlices = append(negativeRegexSlices, regex)
-			}
+			regex = regexp.QuoteMeta(items[2])
 		} else {
 			log.Panicf("Cannot read config: %s, unknown type: %s\n", line, items[0])
+		}
+		if items[1] == "T" {
+			positiveRegexSlices = append(positiveRegexSlices, regex)
+		} else {
+			negativeRegexSlices = append(negativeRegexSlices, regex)
 		}
 	}
 	p.positiveRegex = regexp.MustCompile(strings.Join(positiveRegexSlices, "|"))
@@ -285,14 +285,6 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	client := dns.Client{
 		Net:     a.net,
 		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
-	}
-
-	if strings.HasSuffix(domain, ".arpa.") {
-		response, _, err := client.ExchangeContext(ctx, request, *localDNS)
-		if err == nil {
-			w.WriteMsg(response.SetReply(request))
-		}
-		return
 	}
 
 	ch := make(chan interface{})
