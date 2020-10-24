@@ -58,7 +58,7 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 	var positiveRegexSlices []string
 	var negativeRegexSlices []string
 	for staticScanner.Scan() {
-		line := strings.TrimSpace(strings.Split(staticScanner.Text(), "#")[0])
+		line := strings.TrimSpace(strings.Split(strings.TrimSpace(staticScanner.Text()), "#")[0])
 		if line == "" {
 			continue
 		}
