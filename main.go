@@ -22,7 +22,7 @@ import (
 
 // AnotherDNS yet anther DNS
 type AnotherDNS struct {
-	net string
+	client *dns.Client
 }
 
 type dnsPolicy struct {
@@ -194,7 +194,7 @@ var (
 	probeDNS              = flag.String("probe-dns", "192.168.11.253:8053", "probe DNS server, when this DNS returns a response, mark the query is polluted")
 	probeDomain           = flag.String("probe-domain", "www.google.com", "probe domain")
 	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 2, "probe DNS query timeout factor")
-	queryTimeoutInSeconds = flag.Int("timeout-seconds", 30, "DNS query timeout in seconds")
+	queryTimeoutInSeconds = flag.Int("timeout-seconds", 10, "DNS query timeout in seconds")
 	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
 	policyMemorizeFile    = flag.String("policy-memorize-file", "dns-policy.txt", "the file to save policies")
 	policyStaticFile      = flag.String("policy-static-file", "static-dns-policy.txt", "the file to save policies")
@@ -224,7 +224,7 @@ func refreshProbeTimeout() {
 	}
 }
 
-func shouldUseVPN(domain string) bool {
+func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 	if domain == "" {
 		return true
 	}
@@ -236,10 +236,6 @@ func shouldUseVPN(domain string) bool {
 
 	// async check domain
 	go func() {
-		client := dns.Client{
-			Net:     "udp",
-			Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
-		}
 		msg := new(dns.Msg)
 		msg.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 
@@ -247,7 +243,7 @@ func shouldUseVPN(domain string) bool {
 		ch := make(chan bool)
 
 		probe := func() {
-			_, _, err := client.ExchangeContext(ctx, msg, *probeDNS)
+			_, _, err := a.client.ExchangeContext(ctx, msg, *probeDNS)
 			ch <- err == nil // success means it's polluted
 		}
 
@@ -284,14 +280,9 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		domain = request.Question[0].Name
 	}
 	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(*queryTimeoutInSeconds))
-	client := dns.Client{
-		Net:     a.net,
-		Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
-	}
-
 	ch := make(chan interface{})
 	go func() {
-		response, _, err := client.ExchangeContext(ctx, request, *vpnDNS)
+		response, _, err := a.client.ExchangeContext(ctx, request, *vpnDNS)
 		if err != nil {
 			ch <- err
 		} else {
@@ -310,11 +301,11 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		}
 	}
 
-	useVPNDNS := shouldUseVPN(domain)
+	useVPNDNS := a.shouldUseVPN(domain)
 	if useVPNDNS {
 		sendVPNDNSResponse()
 	} else {
-		response, _, err := client.ExchangeContext(ctx, request, *localDNS)
+		response, _, err := a.client.ExchangeContext(ctx, request, *localDNS)
 		if response != nil {
 			var useVPNDNSResponse = true
 			var isARecord = false
@@ -359,7 +350,10 @@ func loadLocalCIDR() {
 
 func startServer(net string) {
 	impl := &AnotherDNS{
-		net: net,
+		client: &dns.Client{
+			Net:     net,
+			Timeout: time.Second * time.Duration(*queryTimeoutInSeconds),
+		},
 	}
 	srv := &dns.Server{
 		Addr:    ":" + strconv.Itoa(*port),
