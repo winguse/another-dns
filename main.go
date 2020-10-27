@@ -200,6 +200,7 @@ var (
 	policyStaticFile      = flag.String("policy-static-file", "static-dns-policy.txt", "the file to save policies")
 	maxMemorizeItems      = flag.Int("max-memorize-items", 10240, "the max number of policy to remember")
 	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
+	ignoreArpaRequest     = flag.Bool("ignore-arpa-dns", true, "ignore all .arpa reqeust")
 )
 
 func refreshProbeTimeout() {
@@ -275,10 +276,16 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 
 // ServeDNS serve DNS request
 func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
+	defer w.Close()
 	domain := ""
 	if len(request.Question) > 0 {
 		domain = request.Question[0].Name
 	}
+
+	if *ignoreArpaRequest && strings.HasSuffix(domain, ".arpa.") {
+		return
+	}
+
 	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(*queryTimeoutInSeconds))
 	ch := make(chan interface{})
 	go func() {
