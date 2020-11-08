@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/winguse/another-dns/utils"
 	"github.com/yl2chen/cidranger"
 	"golang.org/x/net/context"
 )
@@ -189,6 +190,7 @@ var (
 	probeTimeout = time.Second * time.Duration(2)
 	cnRages      = cidranger.NewPCTrieRanger()
 	policies     = policyManager{}
+	nat          *utils.Nat
 
 	port                  = flag.Int("port", 8053, "port to run on")
 	localDNS              = flag.String("local-dns", "119.28.28.28:53", "local DNS server")
@@ -204,6 +206,9 @@ var (
 	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
 	ignoreArpaRequest     = flag.Bool("ignore-arpa-dns", true, "ignore all .arpa reqeust")
 	mode                  = flag.Int("mode", 0, "running mode: 0 -> auto detect and save result learned; 1 -> base on static policy, if it's not matched, use local dns; 2 -> base on static policy, if it's not matched, use vpn dns")
+	enableNATOnVPNDNS     = flag.Bool("enable-nat-on-vpn-dns", false, "if enable NAT on VPN DNS responses")
+	natRange              = flag.String("nat-range", "198.18.0.0/15", "the fake IP of NAT")
+	natIn                 = flag.String("nat-in", "wg0", "NAT source interface. We only set PREROUTING here, assuming POSTROUTING already handle by MASQUERADE.")
 )
 
 func refreshProbeTimeout() {
@@ -284,6 +289,34 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 	return <-detectCh
 }
 
+func natOnVPNDNSResponse(vpnDNSResponse *dns.Msg) *dns.Msg {
+	if !*enableNATOnVPNDNS {
+		return vpnDNSResponse
+	}
+
+	var selectedARecord *dns.A
+
+	for _, ans := range vpnDNSResponse.Answer {
+		if aRecord, ok := ans.(*dns.A); ok {
+			selectedARecord = aRecord
+		}
+	}
+
+	if selectedARecord == nil {
+		return vpnDNSResponse
+	}
+
+	newResponse := new(dns.Msg)
+	newResponse.Answer = append(newResponse.Answer, selectedARecord)
+
+	// allowcate nat
+	if nat.Allocate(&selectedARecord.A, selectedARecord.Hdr.Ttl) != nil {
+		return newResponse
+	}
+
+	return vpnDNSResponse
+}
+
 // ServeDNS serve DNS request
 func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	defer w.Close()
@@ -303,6 +336,9 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 			selectedDNS = *vpnDNS
 		}
 		response, _, err := a.client.Exchange(request, selectedDNS)
+		if *enableNATOnVPNDNS && useVPN {
+			response = natOnVPNDNSResponse(response)
+		}
 		if err == nil {
 			w.WriteMsg(response.SetReply(request))
 		}
@@ -325,6 +361,9 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		if err, isErr := res.(error); isErr {
 			log.Printf("Error while query VPN DNS: %s\n", err)
 		} else if response, isResponse := res.(*dns.Msg); isResponse {
+			if *enableNATOnVPNDNS {
+				response = natOnVPNDNSResponse(response)
+			}
 			w.WriteMsg(response.SetReply(request))
 		} else {
 			log.Fatal("Unknown message.", res)
@@ -399,6 +438,9 @@ func startServer(net string) {
 func main() {
 	flag.Parse()
 
+	nat = utils.NewNat(*natRange, *natIn)
+	defer nat.Stop()
+
 	policies.maxMemoryItems = *maxMemorizeItems
 	policies.domainPolicies = make(map[string]bool)
 	policies.suffixPolicies = make(map[string]bool)
@@ -417,6 +459,6 @@ func main() {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
-	policies.write(*policyMemorizeFile)
 	log.Printf("Signal (%v) received, stopping\n", s)
+	policies.write(*policyMemorizeFile)
 }
