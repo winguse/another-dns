@@ -51,7 +51,8 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 
 	staticFile, err := os.Open(staticFilePath)
 	if err != nil {
-		log.Fatalf("Failed to static policy file %s\n", err.Error())
+		log.Printf("Failed to static policy file %s, skip loading static config file.\n", err.Error())
+		return
 	}
 	defer staticFile.Close()
 	staticScanner := bufio.NewScanner(staticFile)
@@ -78,7 +79,8 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 
 	memorizeFile, err := os.Open(memorizeFilePath)
 	if err != nil {
-		log.Fatalf("Failed to memorize policy file %s\n", err.Error())
+		log.Printf("Failed to memorize policy file %s, skip loading memory policy file.\n", err.Error())
+		return
 	}
 	defer memorizeFile.Close()
 	scanner := bufio.NewScanner(memorizeFile)
@@ -201,6 +203,7 @@ var (
 	maxMemorizeItems      = flag.Int("max-memorize-items", 10240, "the max number of policy to remember")
 	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
 	ignoreArpaRequest     = flag.Bool("ignore-arpa-dns", true, "ignore all .arpa reqeust")
+	mode                  = flag.Int("mode", 0, "running mode: 0 -> auto detect and save result learned; 1 -> base on static policy, if it's not matched, use local dns; 2 -> base on static policy, if it's not matched, use vpn dns")
 )
 
 func refreshProbeTimeout() {
@@ -231,6 +234,13 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 	}
 	if res, ok := policies.get(domain); ok {
 		return res
+	}
+
+	if *mode == 1 {
+		return false
+	}
+	if *mode == 2 {
+		return false
 	}
 
 	detectCh := make(chan bool)
@@ -286,9 +296,22 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		return
 	}
 
+	if *mode != 0 {
+		selectedDNS := *localDNS
+		useVPN := a.shouldUseVPN(domain)
+		if useVPN {
+			selectedDNS = *vpnDNS
+		}
+		response, _, err := a.client.Exchange(request, selectedDNS)
+		if err == nil {
+			w.WriteMsg(response.SetReply(request))
+		}
+		return
+	}
+
 	ctx, _ := context.WithTimeout(context.Background(), time.Second*time.Duration(*queryTimeoutInSeconds))
 	ch := make(chan interface{})
-	go func() {
+	go func() { // send request to vpn dns
 		response, _, err := a.client.ExchangeContext(ctx, request, *vpnDNS)
 		if err != nil {
 			ch <- err
@@ -342,7 +365,8 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 func loadLocalCIDR() {
 	data, err := ioutil.ReadFile(*localIPListFile)
 	if err != nil {
-		log.Fatalf("Failed to read CIDR file from %s\n", err.Error())
+		log.Printf("Failed to read CIDR file from %s, skip loading local CIDR info.\n", err.Error())
+		return
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		cidr := strings.TrimSpace(line)
