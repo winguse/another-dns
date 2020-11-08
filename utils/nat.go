@@ -156,7 +156,7 @@ func (n *Nat) Allocate(real *net.IP, ttl uint32) *net.IP {
 	if ttl < 1800 {
 		ttl = 1800
 	}
-	n.processEntry("I", real, fake)
+	go n.processEntry("I", real, fake) // async add iptables to reduce latency
 	allocation := &allocatedNat{
 		real:   real,
 		fake:   fake,

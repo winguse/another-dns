@@ -41,7 +41,7 @@ type policyManager struct {
 	domainPolicies  map[string]bool
 	suffixPolicies  map[string]bool
 	keywordPolicies []keywordPolicy
-	policies        map[string]*dnsPolicy
+	learnedPolicies map[string]*dnsPolicy // learned policy will be lowest priority
 	lock            sync.RWMutex
 	maxMemoryItems  int
 }
@@ -100,7 +100,7 @@ func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
 			useVPN,
 			queryCount,
 		}
-		p.policies[domain] = policy
+		p.learnedPolicies[domain] = policy
 	}
 }
 
@@ -115,7 +115,7 @@ func (p *policyManager) write(fileName string) {
 	}
 	defer file.Close()
 
-	for _, policy := range p.policies {
+	for _, policy := range p.learnedPolicies {
 		useVPNField := "F"
 		if policy.useVPN {
 			useVPNField = "T"
@@ -152,7 +152,7 @@ func (p *policyManager) get(domain string) (bool, bool) {
 		}
 	}
 
-	if res, ok := p.policies[domain]; ok {
+	if res, ok := p.learnedPolicies[domain]; ok {
 		res.queryCount++
 		return res.useVPN, true
 	}
@@ -162,7 +162,7 @@ func (p *policyManager) get(domain string) (bool, bool) {
 func (p *policyManager) set(domain string, useVPN bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	p.policies[domain] = &dnsPolicy{
+	p.learnedPolicies[domain] = &dnsPolicy{
 		domain:     domain,
 		useVPN:     useVPN,
 		queryCount: 1,
@@ -172,9 +172,9 @@ func (p *policyManager) set(domain string, useVPN bool) {
 func (p *policyManager) gc() {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	all := make([]*dnsPolicy, len(p.policies))
+	all := make([]*dnsPolicy, len(p.learnedPolicies))
 	i := 0
-	for _, policy := range p.policies {
+	for _, policy := range p.learnedPolicies {
 		all[i] = policy
 		i++
 	}
@@ -182,7 +182,7 @@ func (p *policyManager) gc() {
 		return all[i].queryCount > all[j].queryCount
 	})
 	for i = p.maxMemoryItems; i < len(all); i++ {
-		delete(p.policies, all[i].domain)
+		delete(p.learnedPolicies, all[i].domain)
 	}
 }
 
@@ -235,7 +235,7 @@ func refreshProbeTimeout() {
 
 func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 	if domain == "" {
-		return true
+		return false
 	}
 	if res, ok := policies.get(domain); ok {
 		return res
@@ -396,6 +396,8 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 			if isARecord && useVPNDNSResponse {
 				log.Printf("%s is foreign domain\n", domain)
 				policies.set(domain, true) // override as we use VPN dns
+			}
+			if a.shouldUseVPN(domain) {
 				sendVPNDNSResponse()
 			} else {
 				w.WriteMsg(response.SetReply(request))
@@ -453,8 +455,8 @@ func main() {
 	policies.domainPolicies = make(map[string]bool)
 	policies.suffixPolicies = make(map[string]bool)
 	policies.keywordPolicies = []keywordPolicy{}
-	policies.policies = make(map[string]*dnsPolicy)
-	policies.policies = make(map[string]*dnsPolicy)
+	policies.learnedPolicies = make(map[string]*dnsPolicy)
+	policies.learnedPolicies = make(map[string]*dnsPolicy)
 	policies.load(*policyStaticFile, *policyMemorizeFile)
 	loadLocalCIDR()
 
