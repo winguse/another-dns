@@ -118,7 +118,7 @@ func (n *Nat) gc() {
 
 	newAllocated := []*allocatedNat{}
 	for _, pre := range n.allocated {
-		if pre.expire.After(now) {
+		if pre.expire.Before(now) {
 			n.processEntry("D", pre.real, pre.fake)
 			delete(n.allocatedIPs, ipv4ToUint32(pre.real))
 			n.pool = append(n.pool, pre.fake)
