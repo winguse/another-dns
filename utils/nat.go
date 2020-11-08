@@ -29,6 +29,7 @@ type Nat struct {
 	allocationStartIP uint32
 	allocatedMaxIP    uint32
 	allocationEndIP   uint32
+	allocatedIPs      map[uint32]*allocatedNat
 }
 
 func iptablesNat(ignoreError bool, action string, args ...string) {
@@ -74,6 +75,7 @@ func NewNat(addressCIDR string, ifIn string) *Nat {
 		allocationStartIP: allocationStartIP,
 		allocatedMaxIP:    allocationStartIP,
 		allocationEndIP:   allocationStartIP + uint32(1)<<(bits-ones),
+		allocatedIPs:      make(map[uint32]*allocatedNat),
 	}
 	nat.setupIptables(true)
 	nat.setupIptables(false)
@@ -118,6 +120,7 @@ func (n *Nat) gc() {
 	for _, pre := range n.allocated {
 		if pre.expire.After(now) {
 			n.processEntry("D", pre.real, pre.fake)
+			delete(n.allocatedIPs, ipv4ToUint32(pre.real))
 			n.pool = append(n.pool, pre.fake)
 		} else {
 			newAllocated = append(newAllocated, pre)
@@ -130,6 +133,12 @@ func (n *Nat) gc() {
 func (n *Nat) Allocate(real *net.IP, ttl uint32) *net.IP {
 	n.lock.Lock()
 	defer n.lock.Unlock()
+
+	realU32 := ipv4ToUint32(real)
+	if allocation, ok := n.allocatedIPs[realU32]; ok {
+		log.Printf("previous allocated nat: %s -> %s, expire at %s\n", allocation.real.String(), allocation.fake.String(), allocation.expire.String())
+		return allocation.fake
+	}
 
 	var fake *net.IP
 	if len(n.pool) > 0 {
@@ -144,15 +153,15 @@ func (n *Nat) Allocate(real *net.IP, ttl uint32) *net.IP {
 		n.allocatedMaxIP = n.allocatedMaxIP + 1
 	}
 
-	log.Printf("allocated nat: %s -> %s\n", real.String(), fake.String())
-
 	n.processEntry("I", real, fake)
-
-	n.allocated = append(n.allocated, &allocatedNat{
+	allocation := &allocatedNat{
 		real:   real,
 		fake:   fake,
 		expire: time.Now().Add(time.Second * time.Duration(ttl)),
-	})
+	}
+	n.allocated = append(n.allocated, allocation)
+	n.allocatedIPs[realU32] = allocation
+	log.Printf("allocated nat: %s -> %s, expire at %s\n", real.String(), fake.String(), allocation.expire.String())
 
 	return fake
 }
