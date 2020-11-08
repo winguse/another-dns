@@ -40,9 +40,10 @@ func iptablesNat(ignoreError bool, action string, args ...string) {
 }
 
 func ipv4ToUint32(ip *net.IP) uint32 {
+	bytes := ([]byte)(ip.To4())
 	ret := uint32(0)
-	for i := 0; i < len(*ip); i++ {
-		ret = ret | uint32((*ip)[i])<<(i*8)
+	for i := 0; i < len(bytes); i++ {
+		ret = ret<<8 | uint32(bytes[i])
 	}
 	return ret
 }
@@ -142,6 +143,8 @@ func (n *Nat) Allocate(real *net.IP, ttl uint32) *net.IP {
 		fake = uint32ToIPv4(n.allocatedMaxIP)
 		n.allocatedMaxIP = n.allocatedMaxIP + 1
 	}
+
+	log.Printf("allocated nat: %s -> %s\n", real.String(), fake.String())
 
 	n.processEntry("I", real, fake)
 

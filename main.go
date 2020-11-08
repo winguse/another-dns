@@ -306,11 +306,13 @@ func natOnVPNDNSResponse(vpnDNSResponse *dns.Msg) *dns.Msg {
 		return vpnDNSResponse
 	}
 
-	newResponse := new(dns.Msg)
-	newResponse.Answer = append(newResponse.Answer, selectedARecord)
-
 	// allowcate nat
-	if nat.Allocate(&selectedARecord.A, selectedARecord.Hdr.Ttl) != nil {
+	if fakeIP := nat.Allocate(&selectedARecord.A, selectedARecord.Hdr.Ttl); fakeIP != nil {
+		newResponse := new(dns.Msg)
+		newResponse.Answer = append(newResponse.Answer, &dns.A{
+			A:   *fakeIP,
+			Hdr: selectedARecord.Hdr,
+		})
 		return newResponse
 	}
 
@@ -438,8 +440,10 @@ func startServer(net string) {
 func main() {
 	flag.Parse()
 
-	nat = utils.NewNat(*natRange, *natIn)
-	defer nat.Stop()
+	if *enableNATOnVPNDNS {
+		nat = utils.NewNat(*natRange, *natIn)
+		defer nat.Stop()
+	}
 
 	policies.maxMemoryItems = *maxMemorizeItems
 	policies.domainPolicies = make(map[string]bool)
