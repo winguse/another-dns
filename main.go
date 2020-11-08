@@ -199,16 +199,16 @@ var (
 	probeDomain           = flag.String("probe-domain", "www.google.com", "probe domain")
 	probeTimeoutFactor    = flag.Float64("probe-timeout-factor", 2, "probe DNS query timeout factor")
 	queryTimeoutInSeconds = flag.Int("timeout-seconds", 10, "DNS query timeout in seconds")
-	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line")
+	localIPListFile       = flag.String("local-ip-list-file", "cn-cidrs.txt", "the file path of a file contains one local CIDR per line. if all the dns A response is not in this list, another-dns will response with vpn DNS response.")
 	policyMemorizeFile    = flag.String("policy-memorize-file", "dns-policy.txt", "the file to save policies")
 	policyStaticFile      = flag.String("policy-static-file", "static-dns-policy.txt", "the file to save policies")
 	maxMemorizeItems      = flag.Int("max-memorize-items", 10240, "the max number of policy to remember")
-	noKnowledgeUseVPN     = flag.Bool("no-knowledge-use-vpn", false, "when we first seen a domain, if we use VPN response directly. by doing so, we can reduce the DNS response time")
+	noKnowledgeMode       = flag.Int("no-knowledge-mode", 0, "when we first seen a domain: 0 -> detect; 1 -> use local DNS response (may leak your intent to local dns); 2 -> use VPN response. detect will run in background.")
 	ignoreArpaRequest     = flag.Bool("ignore-arpa-dns", true, "ignore all .arpa reqeust")
-	mode                  = flag.Int("mode", 0, "running mode: 0 -> auto detect and save result learned; 1 -> base on static policy, if it's not matched, use local dns; 2 -> base on static policy, if it's not matched, use vpn dns")
+	detectMode            = flag.Int("mode", 0, "running mode: 0 -> auto detect and save result learned; 1 -> detect deisabled, base on static policy, if it's not matched, use local dns; 2 -> detect deisabled, base on static policy, if it's not matched, use vpn dns")
 	enableNATOnVPNDNS     = flag.Bool("enable-nat-on-vpn-dns", false, "if enable NAT on VPN DNS responses")
 	natRange              = flag.String("nat-range", "198.18.0.0/15", "the fake IP of NAT")
-	natIn                 = flag.String("nat-in", "wg0", "NAT source interface. We only set PREROUTING here, assuming POSTROUTING already handle by MASQUERADE.")
+	natIn                 = flag.String("nat-in", "wg0", "NAT source interface. We only set PREROUTING here, assuming POSTROUTING already handle by MASQUERADE. If you have multiple interfaces, you can use ',' to sparate them.")
 )
 
 func refreshProbeTimeout() {
@@ -241,10 +241,10 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 		return res
 	}
 
-	if *mode == 1 {
+	if *detectMode == 1 { // detect disabled, default to local dns
 		return false
 	}
-	if *mode == 2 {
+	if *detectMode == 2 { // detect disabled, default to vpn dns
 		return false
 	}
 
@@ -282,8 +282,11 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 		detectCh <- polluted
 	}()
 
-	if *noKnowledgeUseVPN {
-		return true // use vpn dns as I don't know
+	if *noKnowledgeMode == 1 { // no knowledge, default to local dns
+		return false
+	}
+	if *noKnowledgeMode == 2 { // no knowledge, default to vpn dns
+		return true
 	}
 
 	return <-detectCh
@@ -331,7 +334,7 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		return
 	}
 
-	if *mode != 0 {
+	if *detectMode != 0 {
 		selectedDNS := *localDNS
 		useVPN := a.shouldUseVPN(domain)
 		if useVPN {
@@ -389,6 +392,7 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 					}
 				}
 			}
+			// if one of the A record is not foreign IP, we won't use VPN response
 			if isARecord && useVPNDNSResponse {
 				log.Printf("%s is foreign domain\n", domain)
 				policies.set(domain, true) // override as we use VPN dns
