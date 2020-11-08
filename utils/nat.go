@@ -153,6 +153,9 @@ func (n *Nat) Allocate(real *net.IP, ttl uint32) *net.IP {
 		n.allocatedMaxIP = n.allocatedMaxIP + 1
 	}
 
+	if ttl < 1800 {
+		ttl = 1800
+	}
 	n.processEntry("I", real, fake)
 	allocation := &allocatedNat{
 		real:   real,
