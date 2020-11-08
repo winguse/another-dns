@@ -74,7 +74,7 @@ func NewNat(addressCIDR string, ifIn string) *Nat {
 
 		allocationStartIP: allocationStartIP,
 		allocatedMaxIP:    allocationStartIP,
-		allocationEndIP:   allocationStartIP + uint32(1)<<(bits-ones),
+		allocationEndIP:   allocationStartIP + uint32(1)<<uint32(bits-ones),
 		allocatedIPs:      make(map[uint32]*allocatedNat),
 	}
 	nat.setupIptables(true)
