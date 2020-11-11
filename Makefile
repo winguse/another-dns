@@ -2,7 +2,7 @@ NAME=another-dns
 BINDIR=bin
 VERSION=$(shell git describe --tags || echo "unknown version")
 BUILDTIME=$(shell date -u)
-GOBUILD=CGO_ENABLED=0 go build -ldflags '-X "github.com/winguse/$(NAME)/constant.Version=$(VERSION)" \
+GOBUILD=go build -ldflags '-X "github.com/winguse/$(NAME)/constant.Version=$(VERSION)" \
 		-X "github.com/winguse/$(NAME)/constant.BuildTime=$(BUILDTIME)" \
 		-w -s'
 

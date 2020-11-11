@@ -1,20 +1,18 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/getlantern/systray"
 	"github.com/miekg/dns"
 	"github.com/winguse/another-dns/utils"
 	"github.com/yl2chen/cidranger"
@@ -26,171 +24,11 @@ type AnotherDNS struct {
 	client *dns.Client
 }
 
-type dnsPolicy struct {
-	domain     string
-	useVPN     bool
-	queryCount int64
-}
-
-type keywordPolicy struct {
-	keyword string
-	useVPN  bool
-}
-
-type policyManager struct {
-	domainPolicies  map[string]bool
-	suffixPolicies  map[string]bool
-	keywordPolicies []keywordPolicy
-	learnedPolicies map[string]*dnsPolicy // learned policy will be lowest priority
-	lock            sync.RWMutex
-	maxMemoryItems  int
-}
-
-func (p *policyManager) load(staticFilePath string, memorizeFilePath string) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	staticFile, err := os.Open(staticFilePath)
-	if err != nil {
-		log.Printf("Failed to static policy file %s, skip loading static config file.\n", err.Error())
-		return
-	}
-	defer staticFile.Close()
-	staticScanner := bufio.NewScanner(staticFile)
-	for staticScanner.Scan() {
-		line := strings.TrimSpace(strings.Split(strings.TrimSpace(staticScanner.Text()), "#")[0])
-		if line == "" {
-			continue
-		}
-		items := strings.Split(line, "\t")
-		if len(items) != 3 {
-			log.Panicf("Cannot read config: %s\n", line)
-		}
-		useVPN := items[1] == "T"
-		if items[0] == "DOMAIN" {
-			p.domainPolicies[items[2]] = useVPN
-		} else if items[0] == "SUFFIX" {
-			p.suffixPolicies[items[2]] = useVPN
-		} else if items[0] == "KEYWORD" {
-			p.keywordPolicies = append(p.keywordPolicies, keywordPolicy{items[2], useVPN})
-		} else {
-			log.Panicf("Cannot read config: %s, unknown type: %s\n", line, items[0])
-		}
-	}
-
-	memorizeFile, err := os.Open(memorizeFilePath)
-	if err != nil {
-		log.Printf("Failed to memorize policy file %s, skip loading memory policy file.\n", err.Error())
-		return
-	}
-	defer memorizeFile.Close()
-	scanner := bufio.NewScanner(memorizeFile)
-	for scanner.Scan() {
-		line := scanner.Text()
-		items := strings.Split(line, "\t")
-		if len(items) != 3 {
-			log.Printf("Skipping line %s\n", line)
-			continue
-		}
-		useVPN := items[0] == "T"
-		queryCount, _ := strconv.ParseInt(items[1], 10, 64)
-		domain := items[2]
-		policy := &dnsPolicy{
-			domain,
-			useVPN,
-			queryCount,
-		}
-		p.learnedPolicies[domain] = policy
-	}
-}
-
-func (p *policyManager) write(fileName string) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	file, err := os.Create(fileName)
-	if err != nil {
-		log.Printf("Failed to write policy file %s\n", err.Error())
-		return
-	}
-	defer file.Close()
-
-	for _, policy := range p.learnedPolicies {
-		useVPNField := "F"
-		if policy.useVPN {
-			useVPNField = "T"
-		}
-		file.WriteString(useVPNField + "\t" + strconv.FormatInt(policy.queryCount, 10) + "\t" + policy.domain + "\n")
-	}
-}
-
-func (p *policyManager) get(domain string) (bool, bool) {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	withoutDotDomain := strings.TrimSuffix(domain, ".")
-
-	items := strings.Split(withoutDotDomain, ".")
-	itemsLen := len(items)
-
-	if useVPN, ok := p.domainPolicies[strings.Join(items, ".")]; ok {
-		log.Printf("matched static domain rule: %s, %t\n", domain, useVPN)
-		return useVPN, true
-	}
-
-	for i := itemsLen - 1; i >= 0; i-- {
-		if useVPN, ok := p.suffixPolicies[strings.Join(items[i:itemsLen], ".")]; ok {
-			log.Printf("matched suffix domain rule: %s, %t\n", domain, useVPN)
-			return useVPN, true
-		}
-	}
-
-	for _, keywordPolicy := range p.keywordPolicies {
-		if strings.Contains(domain, keywordPolicy.keyword) {
-			log.Printf("matched keyword domain rule: %s, %t\n", domain, keywordPolicy.useVPN)
-			return keywordPolicy.useVPN, true
-		}
-	}
-
-	if res, ok := p.learnedPolicies[domain]; ok {
-		res.queryCount++
-		return res.useVPN, true
-	}
-	return false, false
-}
-
-func (p *policyManager) set(domain string, useVPN bool) {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.learnedPolicies[domain] = &dnsPolicy{
-		domain:     domain,
-		useVPN:     useVPN,
-		queryCount: 1,
-	}
-}
-
-func (p *policyManager) gc() {
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	all := make([]*dnsPolicy, len(p.learnedPolicies))
-	i := 0
-	for _, policy := range p.learnedPolicies {
-		all[i] = policy
-		i++
-	}
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].queryCount > all[j].queryCount
-	})
-	for i = p.maxMemoryItems; i < len(all); i++ {
-		delete(p.learnedPolicies, all[i].domain)
-	}
-}
-
 var (
 	probeTimeout = time.Second * time.Duration(2)
 	cnRages      = cidranger.NewPCTrieRanger()
-	policies     = policyManager{}
-	nat          *utils.Nat
+	policies     *utils.PolicyManager
+	vpnResMgr    utils.VPNResponseMgr
 
 	port                  = flag.Int("port", 8053, "port to run on")
 	localDNS              = flag.String("local-dns", "119.28.28.28:53", "local DNS server")
@@ -209,6 +47,9 @@ var (
 	enableNATOnVPNDNS     = flag.Bool("enable-nat-on-vpn-dns", false, "if enable NAT on VPN DNS responses")
 	natRange              = flag.String("nat-range", "198.18.0.0/15", "the fake IP of NAT")
 	natIn                 = flag.String("nat-in", "wg0", "NAT source interface. We only set PREROUTING here, assuming POSTROUTING already handle by MASQUERADE. If you have multiple interfaces, you can use ',' to sparate them.")
+	macOSMode             = flag.Bool("macos", false, "macOS VPN GUI mode, in this mode, will ignore NAT feature")
+	vpnGateway            = flag.String("vpn-gateway", "", "VPN gateway, only used when macos=true")
+	regularGateway        = flag.String("regular-gateway", "", "Regular gateway, only used when macos=true")
 )
 
 func refreshProbeTimeout() {
@@ -227,25 +68,26 @@ func refreshProbeTimeout() {
 		} else {
 			log.Println("Failed to probe domain, if it happen every time, it can be wrong setting of probe domain or probe DNS.")
 		}
-		policies.gc()
-		policies.write(*policyMemorizeFile)
+		policies.Gc()
+		policies.Write(*policyMemorizeFile)
 		time.Sleep(time.Minute)
 	}
 }
 
-func (a *AnotherDNS) shouldUseVPN(domain string) bool {
+// return (isTemporaryDecision, shouldUseVPN)
+func (a *AnotherDNS) shouldUseVPN(domain string) (bool, bool) {
 	if domain == "" {
-		return false
+		return false, false
 	}
-	if res, ok := policies.get(domain); ok {
-		return res
+	if res, ok := policies.Get(domain); ok {
+		return false, res
 	}
 
 	if *detectMode == 1 { // detect disabled, default to local dns
-		return false
+		return false, false
 	}
 	if *detectMode == 2 { // detect disabled, default to vpn dns
-		return false
+		return false, true
 	}
 
 	detectCh := make(chan bool)
@@ -278,48 +120,41 @@ func (a *AnotherDNS) shouldUseVPN(domain string) bool {
 		}
 
 		log.Printf("%s is%s polluted domain.", domain, res)
-		policies.set(domain, polluted)
+		policies.Set(domain, polluted)
 		detectCh <- polluted
 	}()
 
 	if *noKnowledgeMode == 1 { // no knowledge, default to local dns
-		return false
+		return true, false
 	}
 	if *noKnowledgeMode == 2 { // no knowledge, default to vpn dns
-		return true
+		return true, true
 	}
 
-	return <-detectCh
+	return false, <-detectCh
 }
 
-func natOnVPNDNSResponse(vpnDNSResponse *dns.Msg) *dns.Msg {
-	if !*enableNATOnVPNDNS {
+func manipulateVPNDNSResponse(vpnDNSResponse *dns.Msg, temporary bool) *dns.Msg {
+	if !*enableNATOnVPNDNS && !*macOSMode {
 		return vpnDNSResponse
 	}
 
-	var selectedARecord *dns.A
+	return vpnResMgr.Manage(vpnDNSResponse, temporary)
+}
 
-	for _, ans := range vpnDNSResponse.Answer {
+func isForeignDomainARecord(response *dns.Msg) bool {
+	var isForeignDomain = true
+	var isARecord = false
+	for _, ans := range response.Answer {
 		if aRecord, ok := ans.(*dns.A); ok {
-			selectedARecord = aRecord
+			isARecord = true
+			if contains, err := cnRages.Contains(aRecord.A); contains && err == nil {
+				isForeignDomain = false
+				break
+			}
 		}
 	}
-
-	if selectedARecord == nil {
-		return vpnDNSResponse
-	}
-
-	// allowcate nat
-	if fakeIP := nat.Allocate(&selectedARecord.A, selectedARecord.Hdr.Ttl); fakeIP != nil {
-		newResponse := new(dns.Msg)
-		newResponse.Answer = append(newResponse.Answer, &dns.A{
-			A:   *fakeIP,
-			Hdr: selectedARecord.Hdr,
-		})
-		return newResponse
-	}
-
-	return vpnDNSResponse
+	return isARecord && isForeignDomain
 }
 
 // ServeDNS serve DNS request
@@ -336,15 +171,15 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 
 	if *detectMode != 0 {
 		selectedDNS := *localDNS
-		useVPN := a.shouldUseVPN(domain)
+		_, useVPN := a.shouldUseVPN(domain)
 		if useVPN {
 			selectedDNS = *vpnDNS
 		}
 		response, _, err := a.client.Exchange(request, selectedDNS)
-		if *enableNATOnVPNDNS && useVPN {
-			response = natOnVPNDNSResponse(response)
-		}
 		if err == nil {
+			if useVPN {
+				response = manipulateVPNDNSResponse(response, false)
+			}
 			w.WriteMsg(response.SetReply(request))
 		}
 		return
@@ -361,13 +196,13 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		}
 	}()
 
-	sendVPNDNSResponse := func() {
+	sendVPNDNSResponse := func(temporary bool) {
 		res := <-ch
 		if err, isErr := res.(error); isErr {
 			log.Printf("Error while query VPN DNS: %s\n", err)
 		} else if response, isResponse := res.(*dns.Msg); isResponse {
-			if *enableNATOnVPNDNS {
-				response = natOnVPNDNSResponse(response)
+			if isForeignDomainARecord(response) { // only manipulate if it's foreign domain
+				response = manipulateVPNDNSResponse(response, temporary)
 			}
 			w.WriteMsg(response.SetReply(request))
 		} else {
@@ -375,30 +210,20 @@ func (a *AnotherDNS) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		}
 	}
 
-	useVPNDNS := a.shouldUseVPN(domain)
+	isTemporaryDecision, useVPNDNS := a.shouldUseVPN(domain)
 	if useVPNDNS {
-		sendVPNDNSResponse()
+		sendVPNDNSResponse(isTemporaryDecision)
 	} else {
 		response, _, err := a.client.ExchangeContext(ctx, request, *localDNS)
 		if response != nil {
-			var useVPNDNSResponse = true
-			var isARecord = false
-			for _, ans := range response.Answer {
-				if aRecord, ok := ans.(*dns.A); ok {
-					isARecord = true
-					if contains, err := cnRages.Contains(aRecord.A); contains && err == nil {
-						useVPNDNSResponse = false
-						break
-					}
-				}
-			}
 			// if one of the A record is not foreign IP, we won't use VPN response
-			if isARecord && useVPNDNSResponse {
+			if isForeignDomainARecord(response) {
 				log.Printf("%s is foreign domain\n", domain)
-				policies.set(domain, true) // override as we use VPN dns
+				policies.Set(domain, true) // override as we use VPN dns
 			}
-			if a.shouldUseVPN(domain) {
-				sendVPNDNSResponse()
+			isTemporaryDecision, useVPNDNS := a.shouldUseVPN(domain) // get again in case there is high priority rules
+			if useVPNDNS {
+				sendVPNDNSResponse(isTemporaryDecision)
 			} else {
 				w.WriteMsg(response.SetReply(request))
 			}
@@ -443,21 +268,116 @@ func startServer(net string) {
 	}
 }
 
-func main() {
-	flag.Parse()
+func onReady() {
+	routeMgr := utils.NewRouteMgr(*vpnGateway, *regularGateway)
+	anotherDNSStart()
+	systray.SetTitle("🚥")
+	vpnResMgr = routeMgr
 
-	if *enableNATOnVPNDNS {
-		nat = utils.NewNat(*natRange, *natIn)
-		defer nat.Stop()
+	vpnAll := systray.AddMenuItem("All", "Send all traffic to VPN")
+	vpnNothing := systray.AddMenuItem("Direct", "Send all traffic to original network, nothing through VPN")
+	autoDetect := systray.AddMenuItem("Auto", "Auto detect")
+	detectOnTheFly := autoDetect.AddSubMenuItem("Detect on the fly", "will be slidely slower on domain first seen")
+	quickLocalFallback := autoDetect.AddSubMenuItem("Quick local fallback", "for domain first seen, use local network first")
+	quickVPNFallback := autoDetect.AddSubMenuItem("Quick VPN fallback", "for domain first seen, use VPN network first")
+	static := systray.AddMenuItem("Static", "Based on static config and previous knowledge")
+	staticLocalFallback := static.AddSubMenuItem("Prefer local", "Unmatched domain prefer on local network")
+	staticVPNFallback := static.AddSubMenuItem("Prefer VPN", "Unmatched domain prefer on VPN network")
+
+	allOptions := []*systray.MenuItem{
+		vpnAll, vpnNothing,
+		autoDetect, detectOnTheFly, quickLocalFallback, quickVPNFallback,
+		static, staticLocalFallback, staticVPNFallback,
 	}
 
-	policies.maxMemoryItems = *maxMemorizeItems
-	policies.domainPolicies = make(map[string]bool)
-	policies.suffixPolicies = make(map[string]bool)
-	policies.keywordPolicies = []keywordPolicy{}
-	policies.learnedPolicies = make(map[string]*dnsPolicy)
-	policies.learnedPolicies = make(map[string]*dnsPolicy)
-	policies.load(*policyStaticFile, *policyMemorizeFile)
+	unCheckAll := func() {
+		for _, opt := range allOptions {
+			opt.Uncheck()
+		}
+	}
+
+	routeMgr.VPNAuto()
+	switch *detectMode {
+	case 0:
+		autoDetect.Check()
+		switch *noKnowledgeMode {
+		case 0:
+			detectOnTheFly.Check()
+		case 1:
+			quickLocalFallback.Check()
+		case 2:
+			quickVPNFallback.Check()
+		}
+	case 1:
+		static.Check()
+		staticLocalFallback.Check()
+	case 2:
+		static.Check()
+		staticVPNFallback.Check()
+	}
+
+	terminateCh := buildTerminateSignalCh()
+
+	for {
+		select {
+		case <-terminateCh:
+			systray.Quit()
+		case <-vpnAll.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNAll()
+			vpnAll.Check()
+		case <-vpnNothing.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNNothing()
+			vpnNothing.Check()
+		case <-detectOnTheFly.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNAuto()
+			*detectMode = 0
+			*noKnowledgeMode = 0
+			autoDetect.Check()
+			detectOnTheFly.Check()
+		case <-quickLocalFallback.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNAuto()
+			*detectMode = 0
+			*noKnowledgeMode = 1
+			autoDetect.Check()
+			quickLocalFallback.Check()
+		case <-quickVPNFallback.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNAuto()
+			*detectMode = 0
+			*noKnowledgeMode = 2
+			autoDetect.Check()
+			quickVPNFallback.Check()
+		case <-staticLocalFallback.ClickedCh:
+			unCheckAll()
+			routeMgr.VPNAuto()
+			*detectMode = 1
+			static.Check()
+			staticLocalFallback.Check()
+		case <-staticVPNFallback.ClickedCh:
+			routeMgr.VPNAuto()
+			*detectMode = 2
+			unCheckAll()
+			static.Check()
+			staticVPNFallback.Check()
+		}
+	}
+}
+
+func onExit() {
+	// clean up here
+	vpnResMgr.Stop()
+	anotherDNSCleanup()
+	log.Println("exit.")
+}
+
+func anotherDNSStart() {
+	policies = utils.NewPolicyMgr(*maxMemorizeItems)
+	policies.Load(*policyStaticFile, *policyMemorizeFile)
+
 	loadLocalCIDR()
 
 	go refreshProbeTimeout()
@@ -465,10 +385,32 @@ func main() {
 	go startServer("tcp")
 
 	log.Printf("Working on port %d\n", *port)
+}
 
+func anotherDNSCleanup() {
+	policies.Write(*policyMemorizeFile)
+}
+
+func buildTerminateSignalCh() chan os.Signal {
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	s := <-sig
-	log.Printf("Signal (%v) received, stopping\n", s)
-	policies.write(*policyMemorizeFile)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGKILL)
+	return sig
+}
+
+func main() {
+	flag.Parse()
+
+	if *macOSMode {
+		systray.Run(onReady, onExit)
+	} else {
+		if *enableNATOnVPNDNS {
+			vpnResMgr = utils.NewNat(*natRange, *natIn)
+			defer vpnResMgr.Stop()
+		}
+		anotherDNSStart()
+		s := <-buildTerminateSignalCh()
+		log.Printf("Signal (%v) received, stopping\n", s)
+		anotherDNSCleanup()
+	}
 }
